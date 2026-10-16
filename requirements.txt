@@ -5,4 +5,4 @@ google-auth-oauthlib
 pandas
 openpyxl
 python-dotenv
-discord.py
+discord.py>=2.6.0,<3.0.0

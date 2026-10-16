@@ -1,6 +1,13 @@
+import asyncio
+import logging
+import threading
+import weakref
+from functools import lru_cache
+
 import discord
 from discord.ext import commands
 from discord import app_commands
+from emojis import emoji as get_emoji
 import pandas as pd
 import os
 import json
@@ -13,7 +20,16 @@ from googleapiclient.discovery import build
 
 load_dotenv()
 
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+def _parse_owner_id(value: str | None) -> int:
+    """Parse the configured owner ID; invalid or missing values fail closed."""
+    try:
+        parsed = int(value or "0")
+        return parsed if parsed > 0 else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+OWNER_ID = _parse_owner_id(os.getenv("OWNER_ID"))
 
 # =========================
 # CONFIG
@@ -38,6 +54,22 @@ EDITOR_ROLE_NAMES = [
 if not TOKEN:
     raise ValueError("TOKEN not found in environment variables.")
 
+if OWNER_ID == 0:
+    logging.warning("OWNER_ID is missing or invalid. Owner-only commands will deny all users.")
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("friendbot")
+
+# Keep Google API calls off the Discord event loop and cap simultaneous blocking work.
+SHEETS_WRITE_LOCK = asyncio.Lock()
+_SHEETS_THREAD_STATE = threading.local()
+_NORMALIZED_COLUMN_CACHE = {}
+_NORMALIZED_COLUMN_CACHE_MAX = 8
+
+
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -45,35 +77,83 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # =========================
 # TEXT NORMALIZER
 # =========================
+@lru_cache(maxsize=8192)
 def normalize_text(text):
+    """Normalize a value for matching; cached with a fixed memory ceiling."""
     text = str(text).lower().strip()
     return re.sub(r"[^a-z0-9]", "", text)
+
+
+def clear_lookup_caches():
+    """Invalidate derived lookup data after a successful sheet refresh."""
+    _NORMALIZED_COLUMN_CACHE.clear()
+    normalize_text.cache_clear()
+
+
+def normalized_column(dataframe, column):
+    """Return a bounded cached normalized Series for an unchanged DataFrame."""
+    key = (id(dataframe), column, len(dataframe))
+    cached = _NORMALIZED_COLUMN_CACHE.get(key)
+    if cached is not None:
+        dataframe_ref, series = cached
+        if dataframe_ref() is dataframe:
+            return series
+        _NORMALIZED_COLUMN_CACHE.pop(key, None)
+    series = dataframe[column].fillna("").astype(str).map(normalize_text)
+    if len(_NORMALIZED_COLUMN_CACHE) >= _NORMALIZED_COLUMN_CACHE_MAX:
+        _NORMALIZED_COLUMN_CACHE.pop(next(iter(_NORMALIZED_COLUMN_CACHE)))
+    _NORMALIZED_COLUMN_CACHE[key] = (weakref.ref(dataframe), series)
+    return series
 
 
 # =========================
 # GOOGLE SHEETS
 # =========================
 def get_sheets_service():
+    """Create one Sheets client per worker thread to avoid cross-thread reuse."""
     if not GOOGLE_SHEETS_ID:
         raise ValueError("GOOGLE_SHEETS_ID not found in environment variables.")
-
     if not GOOGLE_SERVICE_ACCOUNT_JSON:
         raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON not found in environment variables.")
 
-    creds_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+    service = getattr(_SHEETS_THREAD_STATE, "service", None)
+    if service is None:
+        creds_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+        creds = Credentials.from_service_account_info(creds_info, scopes=GOOGLE_SCOPES)
+        service = build("sheets", "v4", credentials=creds, cache_discovery=False)
+        _SHEETS_THREAD_STATE.service = service
+    return service
 
-    creds = Credentials.from_service_account_info(
-        creds_info,
-        scopes=GOOGLE_SCOPES
-    )
 
-    return build("sheets", "v4", credentials=creds)
+def _clear_dataframe_caches():
+    clear_lookup_caches()
+
+
+async def refresh_data_async():
+    """Refresh the in-memory snapshot without blocking Discord's event loop."""
+    global df
+    async with SHEETS_WRITE_LOCK:
+        fresh = await asyncio.to_thread(load_data, True)
+        df = fresh
+        _clear_dataframe_caches()
+        return df
+
+
+async def write_sheet_and_refresh(write_function, *args):
+    """Serialize a sheet mutation and refresh its in-memory snapshot atomically."""
+    global df
+    async with SHEETS_WRITE_LOCK:
+        await asyncio.to_thread(write_function, *args)
+        fresh = await asyncio.to_thread(load_data, True)
+        df = fresh
+        _clear_dataframe_caches()
+        return df
 
 
 # =========================
 # LOAD DATA
 # =========================
-def load_data():
+def load_data(strict=False):
     try:
         service = get_sheets_service()
 
@@ -85,7 +165,7 @@ def load_data():
         values = result.get("values", [])
 
         if not values:
-            print("❌ Google Sheet is empty.")
+            logger.warning("Google Sheet is empty")
             return pd.DataFrame(
                 columns=["No", "name", "country", "tier", "type", "how_to_obtain", "full_release"]
             )
@@ -108,21 +188,21 @@ def load_data():
             if col in df.columns:
                 df[col] = df[col].astype(str).str.strip()
 
-        print("=== GOOGLE SHEETS DATA LOADED ===")
-        print("Range:", GOOGLE_SHEETS_RANGE)
-        print("Columns:", df.columns.tolist())
-        print("Rows:", len(df))
+        logger.info("Google Sheets data loaded: range=%s rows=%s columns=%s", GOOGLE_SHEETS_RANGE, len(df), df.columns.tolist())
 
         return df
 
     except Exception as e:
-        print(f"❌ Failed to load Google Sheets data: {e}")
+        logger.exception("Failed to load Google Sheets data")
+        if strict:
+            raise
         return pd.DataFrame(
             columns=["No", "name", "country", "tier", "type", "how_to_obtain", "full_release"]
         )
 
 
 df = load_data()
+clear_lookup_caches()
 
 
 # =========================
@@ -318,13 +398,40 @@ def build_item_embed(item, description="✨ Item Overview", color=discord.Color.
     return embed
 
 
+def build_item_v2_text(item, description="✨ Item Overview", full_release="no"):
+    """Render item details as Markdown for a Discord Components V2 layout."""
+    return (
+        f"## {get_emoji('box')} {item.get('name', '-')}\n"
+        f"{description}\n"
+        f"\n{get_emoji('type')} **Type:** {item.get('type', '-')}"
+        f"\n{get_emoji('tier')} **Tier:** {format_tier(item.get('tier', '-'))}"
+        f"\n{get_emoji('country')} **Country:** {clean_country(item.get('country', '-'))}"
+        f"\n{get_emoji('source')} **{get_source_label(full_release).replace('📥 ', '')}:** "
+        f"{get_source_display(item, full_release)}"
+        f"\n\n-# Can't find item? Use the Report Item button below."
+    )
+
+
+def build_item_v2_view(text, *, accent_colour=None):
+    """Build a Components V2 layout with a persistent report action."""
+    view = discord.ui.LayoutView(timeout=None)
+    container = discord.ui.Container(
+        discord.ui.TextDisplay(text[:4000]),
+        discord.ui.Separator(),
+        ReportActionRow(),
+        accent_colour=accent_colour or discord.Colour.gold(),
+    )
+    view.add_item(container)
+    return view
+
+
 def find_best_match_by_name(dataframe, name):
     search_name = normalize_text(name)
 
     if not search_name or "name" not in dataframe.columns:
         return pd.DataFrame()
 
-    normalized_names = dataframe["name"].fillna("").astype(str).apply(normalize_text)
+    normalized_names = normalized_column(dataframe, "name")
 
     exact_result = dataframe[normalized_names == search_name]
     if not exact_result.empty:
@@ -346,9 +453,9 @@ def find_best_match_by_type_and_name(dataframe, item_type, name):
     ):
         return pd.DataFrame()
 
-    normalized_types = dataframe["type"].fillna("").astype(str).apply(normalize_text)
+    normalized_types = normalized_column(dataframe, "type")
     type_filtered_df = dataframe[normalized_types == normalized_type]
-    type_filtered_names = type_filtered_df["name"].fillna("").astype(str).apply(normalize_text)
+    type_filtered_names = normalized_column(type_filtered_df, "name")
 
     exact_result = type_filtered_df[type_filtered_names == normalized_name]
     if not exact_result.empty:
@@ -364,7 +471,7 @@ def item_exists_in_database(dataframe, item_name):
     if not normalized_input or "name" not in dataframe.columns:
         return False, None
 
-    normalized_names = dataframe["name"].fillna("").astype(str).apply(normalize_text)
+    normalized_names = normalized_column(dataframe, "name")
 
     exact_result = dataframe[normalized_names == normalized_input]
     if not exact_result.empty:
@@ -388,7 +495,7 @@ def get_exact_item_row_index(dataframe, item_name):
     if not normalized_input:
         return None, None
 
-    normalized_names = dataframe["name"].fillna("").astype(str).apply(normalize_text)
+    normalized_names = normalized_column(dataframe, "name")
     matched_indices = dataframe.index[normalized_names == normalized_input].tolist()
 
     if not matched_indices:
@@ -749,7 +856,7 @@ async def name_by_type_autocomplete(interaction: discord.Interaction, current: s
     if selected_type:
         selected_type_normalized = normalize_text(selected_type)
         filtered_df = filtered_df[
-            filtered_df["type"].fillna("").astype(str).apply(normalize_text)
+            normalized_column(filtered_df, "type")
             == selected_type_normalized
         ]
 
@@ -910,6 +1017,19 @@ class ReportView(discord.ui.View):
         await interaction.response.send_modal(ReportModal())
 
 
+class ReportActionRow(discord.ui.ActionRow):
+    """Components V2 action row that preserves the report modal workflow."""
+
+    @discord.ui.button(
+        label="Report Item",
+        style=discord.ButtonStyle.danger,
+        custom_id="report_missing_item_button_v2",
+        emoji=get_emoji("report"),
+    )
+    async def report_v2(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(ReportModal())
+
+
 # =========================
 # COMMAND: /check
 # =========================
@@ -936,9 +1056,8 @@ async def check(interaction: discord.Interaction, name: str, full_release: str =
         return
 
     item = result.iloc[0]
-    embed = build_item_embed(item, full_release=full_release)
-
-    await interaction.response.send_message(embed=embed, view=ReportView())
+    view = build_item_v2_view(build_item_v2_text(item, full_release=full_release))
+    await interaction.response.send_message(view=view)
 
 
 # =========================
@@ -968,14 +1087,11 @@ async def type_command(interaction: discord.Interaction, type: str, name: str, f
         return
 
     item = result.iloc[0]
-    embed = build_item_embed(
-        item,
-        description="✨ Item Overview by Type",
-        color=discord.Color.blue(),
-        full_release=full_release,
+    view = build_item_v2_view(
+        build_item_v2_text(item, description="✨ Item Overview by Type", full_release=full_release),
+        accent_colour=discord.Colour.blue(),
     )
-
-    await interaction.response.send_message(embed=embed, view=ReportView())
+    await interaction.response.send_message(view=view)
 
 
 # =========================
@@ -1055,11 +1171,7 @@ async def item_command(
         )
         return
 
-    embed = discord.Embed(
-        title="📦 Multi Item Check",
-        description=f"Checking {len(item_inputs)} unique item(s)",
-        color=discord.Color.purple(),
-    )
+    result_lines = [f"## {get_emoji('box')} Multi Item Check", f"Checking {len(item_inputs)} unique item(s)"]
 
     found_count = 0
     not_found_count = 0
@@ -1069,40 +1181,35 @@ async def item_command(
 
         if result.empty:
             not_found_count += 1
-            embed.add_field(
-                name=f"❌ {item_name}",
-                value="Data not found",
-                inline=False,
-            )
+            result_lines.append(f"\n{get_emoji('error')} **{item_name}**\nData not found")
             continue
 
         item = result.iloc[0]
         found_count += 1
 
-        embed.add_field(
-            name=f"✅ {item.get('name', item_name)}",
-            value=(
-                f"**Type:** {item.get('type', '-')}\n"
-                f"**Tier:** {format_tier(item.get('tier', '-'))}\n"
-                f"**Country:** {clean_country(item.get('country', '-'))}\n"
-                f"**{get_source_label(full_release).replace('📥 ', '')}:** {get_source_display(item, full_release)}"
-            ),
-            inline=False,
+        result_lines.append(
+            f"\n{get_emoji('success')} **{item.get('name', item_name)}**\n"
+            f"{get_emoji('type')} **Type:** {item.get('type', '-')}\n"
+            f"{get_emoji('tier')} **Tier:** {format_tier(item.get('tier', '-'))}\n"
+            f"{get_emoji('country')} **Country:** {clean_country(item.get('country', '-'))}\n"
+            f"{get_emoji('source')} **{get_source_label(full_release).replace('📥 ', '')}:** {get_source_display(item, full_release)}"
         )
 
     if skipped_duplicates:
-        embed.add_field(
-            name="⚠️ Skipped Duplicate",
-            value=", ".join(f"`{item}`" for item in skipped_duplicates),
-            inline=False,
+        result_lines.append(
+            f"\n{get_emoji('warning')} **Skipped Duplicate**\n"
+            + ", ".join(f"`{item}`" for item in skipped_duplicates)
         )
 
-    embed.set_footer(text=f"Found: {found_count} | Not Found: {not_found_count} | Skipped: {len(skipped_duplicates)}")
+    result_lines.append(
+        f"\n-# Found: {found_count} | Not Found: {not_found_count} | Skipped: {len(skipped_duplicates)}"
+    )
+    result_text = "\n".join(result_lines)
+    if len(result_text) > 3900:
+        result_text = result_text[:3850] + "\n\n-# Results shortened to fit Discord's Components V2 message limit."
 
-    if not_found_count > 0:
-        await interaction.response.send_message(embed=embed, view=ReportView())
-    else:
-        await interaction.response.send_message(embed=embed)
+    view = build_item_v2_view(result_text, accent_colour=discord.Colour.purple())
+    await interaction.response.send_message(view=view)
 
 
 # =========================
@@ -1166,7 +1273,8 @@ async def add_command(
 
     try:
         next_no = get_next_no_value(df)
-        append_item_to_sheet(
+        await write_sheet_and_refresh(
+            append_item_to_sheet,
             next_no,
             clean_name,
             clean_country_value,
@@ -1174,7 +1282,6 @@ async def add_command(
             clean_type_value,
             clean_source,
         )
-        df = load_data()
 
         embed = discord.Embed(
             title="✅ Item Added",
@@ -1283,7 +1390,8 @@ async def edit_command(
     updated_source = new_how_to_obtain.strip() if new_how_to_obtain else old_source
 
     try:
-        update_item_in_sheet(
+        await write_sheet_and_refresh(
+            update_item_in_sheet,
             sheet_row_number,
             current_no,
             updated_name,
@@ -1292,7 +1400,6 @@ async def edit_command(
             updated_type,
             updated_source,
         )
-        df = load_data()
 
         embed = discord.Embed(
             title="✏️ Item Updated",
@@ -1368,8 +1475,7 @@ async def delete_command(interaction: discord.Interaction, name: str):
     item_source = str(item_row.get("how_to_obtain", "-")).strip()
 
     try:
-        delete_item_from_sheet(sheet_row_number)
-        df = load_data()
+        await write_sheet_and_refresh(delete_item_from_sheet, sheet_row_number)
 
         await interaction.response.send_message(
             f"🗑️ Deleted item: `{item_name}`",
@@ -1418,7 +1524,15 @@ async def reload(interaction: discord.Interaction):
         return
 
     global df
-    df = load_data()
+    try:
+        await refresh_data_async()
+    except Exception:
+        logger.exception("Owner-triggered reload failed")
+        await interaction.response.send_message(
+            "❌ Failed to reload Google Sheets data. The previous in-memory data was retained.",
+            ephemeral=True,
+        )
+        return
     await interaction.response.send_message("✅ Data reloaded!", ephemeral=True)
 
     log_embed = discord.Embed(
@@ -1437,6 +1551,31 @@ async def reload(interaction: discord.Interaction):
         inline=False,
     )
     await send_log_embed(interaction, log_embed)
+
+
+# =========================
+# COMMAND: /botowner
+# =========================
+@bot.tree.command(
+    name="botowner",
+    description="Check bot owner configuration (owner only)",
+    guild=discord.Object(id=GUILD_ID),
+)
+async def botowner(interaction: discord.Interaction):
+    if not user_has_owner_access(interaction):
+        await interaction.response.send_message(make_owner_denied_message(), ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="🛡️ Bot Owner Status",
+        description="Owner authorization is active for this account.",
+        color=discord.Color.green(),
+        timestamp=datetime.now(),
+    )
+    embed.add_field(name="Owner ID configured", value="Yes", inline=True)
+    embed.add_field(name="Loaded items", value=str(len(df)), inline=True)
+    embed.add_field(name="Cache", value="Bounded normalized-text and column caches", inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # =========================
@@ -1506,15 +1645,27 @@ async def ping(interaction: discord.Interaction):
 # =========================
 # READY EVENT
 # =========================
+_view_registered = False
+_commands_synced = False
+
+
 @bot.event
 async def on_ready():
+    global _view_registered, _commands_synced
+    guild = discord.Object(id=GUILD_ID)
 
-    # HAPUS SEMUA GLOBAL COMMAND
-    bot.tree.clear_commands(guild=None)
-    await bot.tree.sync()
+    if not _view_registered:
+        bot.add_view(ReportView())
+        # Register the Components V2 report action so its custom_id survives restarts.
+        bot.add_view(build_item_v2_view("Persistent Components V2 report action"))
+        _view_registered = True
 
-    print("✅ Semua global command sudah dihapus.")
-    print(f"✅ Bot ready! {bot.user}")
+    if not _commands_synced:
+        synced = await bot.tree.sync(guild=guild)
+        logger.info("Synced %s guild command(s)", len(synced))
+        _commands_synced = True
+
+    logger.info("Bot ready as %s", bot.user)
 
 
 # =========================
