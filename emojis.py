@@ -1,4 +1,4 @@
-"""Central emoji registry for FriendBot.
+"""Central emoji registry for MW Data.
 
 Custom application emojis are configured by their exact Discord emoji name and ID.
 If an ID is blank or invalid, the registry falls back to a Unicode emoji so the bot

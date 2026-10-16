@@ -61,7 +61,7 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-logger = logging.getLogger("friendbot")
+logger = logging.getLogger("mw_data")
 
 # Keep Google API calls off the Discord event loop and cap simultaneous blocking work.
 SHEETS_WRITE_LOCK = asyncio.Lock()

@@ -1,8 +1,8 @@
-# FriendBot — Components V2 & Emoji Edition
+# MW Data — Components V2 & Emoji Edition
 
 A Discord item-lookup bot backed by Google Sheets. This edition adds Discord Components V2 result layouts and a central custom-emoji registry while retaining the existing single-guild workflow.
 
-> **Compatibility note:** This README describes the supplied `FriendBot_Scaled_V2_Emoji_Replacement` source. It does not claim multi-guild support, a distributed queue, Redis, or a database-backed cache.
+> **Compatibility note:** This README describes the supplied `MW Data_Scaled_V2_Emoji_Replacement` source. It does not claim multi-guild support, a distributed queue, Redis, or a database-backed cache.
 
 ## Features
 
@@ -22,7 +22,7 @@ A Discord item-lookup bot backed by Google Sheets. This edition adds Discord Com
 ## Project layout
 
 ```text
-FriendBot_Scaled/
+MW Data_Scaled/
 ├── bot.py
 ├── emojis.py
 ├── requirements.txt
@@ -161,3 +161,11 @@ These checks do not replace live integration testing. Before production deployme
 ## Safe upgrade / rollback
 
 Back up the current project and `.env` before replacing files. Keep the previous version available until the new version has been tested in Discord. If the new version fails, stop it and restore the previous source and dependency set; do not delete or overwrite the Google Sheet as part of rollback.
+
+## Complete replacement package
+
+This archive includes the complete bot entry point (`bot.py`), emoji registry, dependency list, environment template, regression checks, architecture notes, and operations guides. Configure `.env` from `.env.example` before running. Do not commit `.env` or service-account credentials.
+
+## Validation
+
+Run `python -m py_compile bot.py emojis.py` and `python -m unittest discover -s tests -v`. Static tests do not replace a live test in a private Discord server connected to a test spreadsheet.
